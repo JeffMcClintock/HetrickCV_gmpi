@@ -58,10 +58,66 @@ set(_rack_static_modules
     PhasorToWaveforms PolymetricPhasors Probability RandomGates Rotator
     Rungler Scanner TrigShaper VectorMix XYToPolar)
 
+# HETRICKCV_EXCLUDE_MODULES -- drop modules from the set before building.
+#
+# Exists because a Rack module declares its Model as a GLOBAL symbol
+# (`Model* modelFoo`), so two packs shipping a module of the same name collide
+# at link with a duplicate-symbol error that names neither pack. Measured
+# 2026-08-25: HetrickCV and VCV Fundamental overlap on exactly ONE name,
+# MidSide, out of 66 and 38.
+#
+# The consumer decides which pack wins, because only it knows what else is
+# linked. TIDE excludes it here when TIDE_VCV_FUNDAMENTAL is also ON.
+set(HETRICKCV_EXCLUDE_MODULES "" CACHE STRING "module names to leave out of HetrickCV_static (e.g. names that collide with another pack)")
+
+if(HETRICKCV_EXCLUDE_MODULES)
+    foreach(_x ${HETRICKCV_EXCLUDE_MODULES})
+        if(NOT _x IN_LIST _rack_static_modules)
+            message(WARNING "HetrickCV: excluded module '${_x}' is not in the set - check the spelling, it is being ignored")
+        endif()
+        list(REMOVE_ITEM _rack_static_modules ${_x})
+    endforeach()
+    message(STATUS "HetrickCV: excluding ${HETRICKCV_EXCLUDE_MODULES}")
+endif()
+
 add_library(HetrickCV_static INTERFACE)
 
 set(_modules_dir ${CMAKE_CURRENT_SOURCE_DIR}/../modules)
 set(_shared_dir  ${CMAKE_CURRENT_SOURCE_DIR}/../shared)
+
+# SHARED IMPLEMENTATION UNITS -- not modules, and easy to miss because nothing
+# references them until the LINK. HetrickCV keeps several class bodies in their
+# own .cpp (HCVCuspMap::generate() is the one that surfaced this), so compiling
+# only the module wrappers leaves them undefined. Syntax-checking every module
+# passes and the link then fails, which is exactly what happened.
+# The Gamma set is upstream HetrickCV's own -- its Makefile compiles exactly
+# these three (arr, Domain, scl) for the Rack plugin. Gamma's CMakeLists names
+# four more (DFT, FFT_fftpack, fftpack++1, fftpack++2) that the plugin build
+# does not use; left out until something needs them, rather than carrying an
+# FFT nobody calls.
+add_library(hcv_shared OBJECT
+    ${_shared_dir}/src/HetrickUtilities.cpp
+    ${_shared_dir}/src/DSP/HCVChaos.cpp
+    ${_shared_dir}/src/DSP/Phasors/HCVPhasorAnalyzers.cpp
+    ${_shared_dir}/src/DSP/Phasors/HCVPhasorEffects.cpp
+    ${_shared_dir}/Gamma_src/arr.cpp
+    ${_shared_dir}/Gamma_src/Domain.cpp
+    ${_shared_dir}/Gamma_src/scl.cpp
+)
+target_include_directories(hcv_shared PRIVATE
+    ${_shared_dir}
+    ${_shared_dir}/src
+    ${GMPI_SDK}
+    ${GMPI_SDK}/Core
+    ${GMPI_UI_SDK}
+    ${RACK_STATIC_TINYXML2_INCLUDE}
+)
+target_link_libraries(hcv_shared PRIVATE SynthEditRackAdaptorStatic)
+set_target_properties(hcv_shared PROPERTIES
+    CXX_STANDARD 23
+    CXX_STANDARD_REQUIRED ON
+    POSITION_INDEPENDENT_CODE ON)
+target_sources(HetrickCV_static INTERFACE $<TARGET_OBJECTS:hcv_shared>)
 
 foreach(_m ${_rack_static_modules})
     set(_tgt hcvmod_${_m})
@@ -99,10 +155,18 @@ foreach(_m ${_rack_static_modules})
 endforeach()
 
 # Exactly one copy of the deferred-registration queue per binary. If the host
-# also links VCV_Fundamental_static, only ONE of them may contribute this.
-if(NOT TARGET_RACK_STATIC_REGISTRATION_LINKED)
+# also links VCV_Fundamental_static, only ONE aggregate may contribute it or
+# the objects are duplicated on the link line.
+#
+# A GLOBAL PROPERTY, not a cache variable, and that distinction cost a build:
+# a CACHE INTERNAL guard survives between configures, so the SECOND configure
+# of the same tree skipped the registration object entirely and every module's
+# autoRegisterModel() came out undefined. A global property is per-configure,
+# which is the scope this guard actually wants.
+get_property(_rack_reg_linked GLOBAL PROPERTY RACK_STATIC_REGISTRATION_LINKED)
+if(NOT _rack_reg_linked)
     target_sources(HetrickCV_static INTERFACE $<TARGET_OBJECTS:RackAdaptorStaticRegistration>)
-    set(TARGET_RACK_STATIC_REGISTRATION_LINKED ON CACHE INTERNAL "")
+    set_property(GLOBAL PROPERTY RACK_STATIC_REGISTRATION_LINKED ON)
 endif()
 
 target_link_libraries(HetrickCV_static INTERFACE SynthEditRackAdaptorStatic)
